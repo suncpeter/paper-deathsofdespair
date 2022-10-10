@@ -1,0 +1,1098 @@
+---
+title: "Code for 'Deaths of Despair and Population Aging in Missouri'"
+author: "Sun, P., Lawlor, E., Morrow-Howell, N., Park, S., & McBride, T."
+date: "2022"
+output:
+  pdf_document:
+    number_sections: false
+header-includes:
+- \usepackage{float}
+- \usepackage{pdflscape}
+- \usepackage{threeparttable}
+- \usepackage{threeparttablex}
+- \newcommand{\blandscape}{\begin{landscape}}
+- \newcommand{\elandscape}{\end{landscape}}
+toc: yes
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+options(scipen=999)
+options(knitr.kable.NA = "") # no NAs in kable
+
+library(tidyverse)
+library(knitr)
+library(kableExtra)
+library(tidycensus)
+library(rgdal)
+library(ggmap)
+library(viridis)
+library(ggrepel)
+library(mapproj)
+library(maptools)
+library(rgeos)
+library(sf)
+library(gridExtra)
+library(stringr)
+library(ggsci)
+library(tableone)
+library(broom)
+library(censusapi)
+library(scales)
+
+# API key setup for tidycensus and Google API
+readRenviron(".Renviron")
+census_api_key(Sys.getenv("CENSUS_API_KEY"), install = TRUE, overwrite = TRUE)
+register_google(Sys.getenv("GOOGLE_API"))
+
+fix_names <- function(df, col) {
+  pattern <- "^(.+)[,].+$"
+  col_enq <- enquo(col)
+  df <- df %>%
+    mutate(!!col_enq := ifelse(grepl(", MO|, Missouri", !!col_enq),
+      str_to_title(str_match(!!col_enq , pattern)[,2]),
+      !!col_enq)) %>%
+    mutate(!!col_enq := ifelse(grepl("County", !!col_enq),
+      str_match(!!col_enq, "(.+) County")[,2],
+      !!col_enq)) %>%
+    mutate(!!col_enq := str_to_title(!!col_enq))
+  return(df)
+}
+
+# County names and fips
+gen_MO_counties_fips <- tidycensus::fips_codes %>%
+  as_tibble() %>%
+  filter(state == "MO") %>%
+  select(county_code, county) %>%
+  fix_names(county)
+
+gen_MO_counties <- gen_MO_counties_fips %>% select(County = county)
+aaa_regions <- read_csv("data/AAACountyList.csv")
+
+# conversion df
+map_fips <- gen_MO_counties_fips %>%
+  rename(COUNTYFIPS = county_code) %>%
+  mutate(COUNTYFIPS = as.factor(COUNTYFIPS)) %>%
+  rename(County = county)
+
+tidy_file <- function(filename, col_types = NULL) {
+  f <- read_tsv(filename, col_names = TRUE, col_types = col_types)
+  names(f) <- make.names(names(f), unique = TRUE)
+  return(f)
+}
+
+# Avoid clashes
+select <- dplyr::select
+summarise <- dplyr::summarise
+
+# Transform the codes to a df where col1 = variable names and col2 = desired group names
+gen_codes <- function(vargroup, width, vars) {
+  numbers <- keep(vars, is.numeric)
+  groups <- unlist(keep(vars, is.character))
+  lengths <- unlist(lapply(numbers, length))
+  df <- data.frame(group = groups, freq = lengths) %>%
+    uncount(freq) %>%
+    mutate(varnum = unlist(numbers)) %>%
+    mutate(variable = paste0(vargroup, str_pad(string = varnum, width = width, pad = 0))) %>%
+    select(variable, group)
+ return(df)
+}
+
+# General Function for Joining ACS Data and New Groups
+get_acs_sums_G <- function(year, geography, codes, state = "MO", summary_var = NULL) {
+  join_and_sum <- function(year) {
+    df <- get_acs(geography = geography, state = state, year = year, variables = codes$variable, cache_table = TRUE, summary_var = summary_var)
+    df_sums <- df %>%
+      fix_names(NAME) %>%
+      rename(county = NAME) %>%
+      mutate(year = year) %>%
+      left_join(codes, by = "variable")
+  }
+  df <- map_dfr(year, join_and_sum)
+  return(df)
+}
+
+# Browse ACS data
+acs_data <- load_variables(2018, "acs5", cache = TRUE)
+acs_data <- acs_data %>% rename(variable = name)
+# view(acs_data)
+
+# Fix dplyr
+recode <- dplyr::recode
+select <- dplyr::select
+```
+
+\newpage
+
+# Table 1. Demographic Characteristics of Area Agency on Aging Regions in 2000 and 2018
+
+```{r echo=FALSE, message=FALSE, error=FALSE, warning=FALSE}
+
+# Function to get data
+get_2018_est <- function(bk, lower_age, upper_age) {
+
+  # Sanity Check with ACS labels
+  bk <- bk %>%
+    left_join(acs_data, by = "variable")
+  
+  # Get sums per group
+  bk2 <- bk %>%
+    select(pop_county = summary_est, County = county, group, pop_group = estimate) %>%
+    group_by(pop_county, County, group) %>%
+    summarise(pop_group = sum(pop_group)) %>%
+    ungroup() %>%
+    left_join(aaa_regions, by = "County")
+  
+  # Get total population per AAA Region
+  bk3 <- bk2 %>%
+    group_by(County) %>%
+    slice(1) %>%
+    ungroup() %>%
+    group_by(AAARegion) %>%
+    summarise(pop_aaa = sum(pop_county)) %>%
+    ungroup()
+  
+  # Check sum
+  #sum(bk3$pop_aaa) # good, this matches with the state total black pop 704,896 in social explorer
+  
+  # Get total black pop per AAA Region per age group
+  bk4 <- bk2 %>%
+    group_by(AAARegion, group) %>%
+    summarise(pop_aaa_group = sum(pop_group)) %>%
+    ungroup()
+  
+  # Now merge total black pop per AAA Region per age group to total pop per AAA and get rates
+  bk5 <- bk4 %>%
+    left_join(bk3, by = "AAARegion") %>%
+    mutate(rate.2018 = pop_aaa_group / pop_aaa) %>%
+    mutate(group = recode(group, `L` = upper_age, `M` = lower_age))
+
+  return(bk5)
+}
+
+
+# Function
+get_dem_stats <- function(df, group_name, lower_age, upper_age) {
+  # This gets the population per Middle-Life/Later-life Age Group
+  df2 <- df %>%
+    select(County = county, estimate, group) %>%
+    left_join(aaa_regions, by = "County") %>%
+    group_by(AAARegion, group) %>%
+    summarise(group.sum = sum(estimate)) %>%
+    ungroup() %>%
+    mutate(group = recode(group, `L` = upper_age, `M` = lower_age))
+  names(df2) <- c("AAARegion", "AgeGroup", group_name)
+  return(df2)
+}
+
+# New function with 2018 stats 25+ above for final manuscript
+get_dem_stats2 <- function(df, group_name, lower_age, upper_age) {
+  df2 <- df %>%
+    select(County = county, estimate, group) %>%
+    left_join(aaa_regions, by = "County") %>%
+    group_by(AAARegion) %>%
+    summarise(group.sum = sum(estimate), .groups = "drop")
+  names(df2) <- c("AAARegion", group_name)
+  return(df2)
+}
+
+############### BLACK ################
+
+# acs_data %>%
+#   filter(str_detect(variable, "B01001B")) %>%
+#   print(n = 50)
+bk_codes <- gen_codes(vargroup = "B01001B_", width = 3, vars = list(
+  9, "M", 10, "M", 11, "M", 12, "M", 13, "M", 24, "M", 25, "M", 26, "M", 27, "M", 28, "M", # 25-64 male and female
+  14, "L", 15, "L", 16, "L", 29, "L", 30, "L", 31, "L")) # 65+ male and female
+bk <- get_acs_sums_G(year = 2018, geography = "county", codes = bk_codes, summary_var = "B01001B_001")
+bk2 <- get_dem_stats(bk, "Black", "25-64", "65+")
+FINAL.bk2 <- get_dem_stats2(bk, "Black", "25-64", "65+")
+
+############### EDUCATION ################
+
+# acs_data %>%
+#   filter(str_detect(concept, "SEX BY AGE BY EDUCATIONAL ATTAINMENT")) %>%
+#   view()
+
+# LESS THAN Bachelor's degree code
+edu_codes <- gen_codes(vargroup = "B15001_", width = 3, vars = list(
+  12, "M", 13, "M", 14, "M", 15, "M", 16, "M", # 25-34 male < BA
+  20, "M", 21, "M", 22, "M", 23, "M", 24, "M", 28, "M", 29, "M", 30, "M", 31, "M", 32, "M", # 35-64 male, < BA
+  53, "M", 54, "M", 55, "M", 56, "M", 57, "M", # 25-34 female, < BA
+  61, "M", 62, "M", 63, "M", 64, "M", 65, "M", 69, "M", 70, "M", 71, "M", 72, "M", 73, "M", # 35-64 female, < BA
+  36, "L", 37, "L", 38, "L", 39, "L", 40, "L", # 65+ male < BA
+  77, "L", 78, "L", 79, "L", 80, "L", 81, "L")) # 65+ female < BA
+edu <- get_acs_sums_G(year = 2018, geography = "county", codes = edu_codes, summary_var = "B15001_001")
+edu2 <- get_dem_stats(edu, "Edu", "25-64", "65+")
+FINAL.edu2 <- get_dem_stats2(edu, "Edu", "25-64", "65+")
+
+######## POVERTY #########
+
+# acs_data %>%
+#   filter(str_detect(variable, "B17001_")) %>%
+#   view()
+
+# Total income in the past 12 months below poverty level
+pov_codes <- gen_codes(vargroup = "B17001_", width = 3, vars = list(
+  11, "M", 12, "M", 13, "M", 14, "M", # 25-64 male
+  25, "M", 26, "M", 27, "M", 28, "M", # 25-64 female
+  15, "L", 16, "L", # 65+ male
+  29, "L", 30, "L")) # 65+ female
+pov <- get_acs_sums_G(year = 2018, geography = "county", codes = pov_codes, summary_var = "B17001_001")
+pov2 <- get_dem_stats(pov, "Pov", "25-64", "65+")
+FINAL.pov2 <- get_dem_stats2(pov, "Pov", "25-64", "65+")
+
+########## GENDER ##########
+
+# acs_data %>%
+#   filter(str_detect(concept, "SEX BY AGE")) %>%
+#   view()
+
+# % Male
+sex_codes <- gen_codes(vargroup = "B01001_", width = 3, vars = list(
+  11, "M", 12, "M", 13, "M", 14, "M", 15, "M", 16, "M", 17, "M", 18, "M", 19, "M", # 25-64 male
+  20, "L", 21, "L", 22, "L", 23, "L", 24, "L", 25, "L")) # 65+ male
+sex <- get_acs_sums_G(year = 2018, geography = "county", codes = sex_codes, summary_var = "B01001_001")
+sex2 <- get_dem_stats(sex, "Male", "25-64", "65+")
+FINAL.sex2 <- get_dem_stats2(sex, "Male", "25-64", "65+")
+
+########## AAA POP = APOP ##########
+
+# Get total pop in the 25-64 and 65+ categories for each county and AAA region
+# acs_data %>%
+#   filter(str_detect(concept, "SEX BY AGE")) %>%
+#   view()
+ap_codes <- gen_codes(vargroup = "B01001_", width = 3, vars = list(
+  11, "M", 12, "M", 13, "M", 14, "M", 15, "M", 16, "M", 17, "M", 18, "M", 19, "M", # 25-64 male
+  35, "M", 36, "M", 37, "M", 38, "M", 39, "M", 40, "M", 41, "M", 42, "M", 43, "M", # 25-64 female
+  20, "L", 21, "L", 22, "L", 23, "L", 24, "L", 25, "L", # 65+ male
+  44, "L", 45, "L", 46, "L", 47, "L", 48, "L", 49, "L")) # 65+ female
+ap <- get_acs_sums_G(year = 2018, geography = "county", codes = ap_codes, summary_var = "B01001_001")
+ap2 <- get_dem_stats(ap, "Pop", "25-64", "65+")
+FINAL.ap2 <- get_dem_stats2(ap, "Pop", "25-64", "65+")
+
+# Merge (new code without age groups)
+FINAL.dem.2018 <- FINAL.bk2 %>%
+  left_join(FINAL.edu2, by = c("AAARegion")) %>%
+  left_join(FINAL.pov2, by = c("AAARegion")) %>%
+  left_join(FINAL.sex2, by = c("AAARegion")) %>%
+  left_join(FINAL.ap2, by = c("AAARegion")) %>%
+  mutate_at(vars(Black:Male), list(~./Pop))
+
+# Generate kable
+FINAL.dem.2018.tab <- FINAL.dem.2018 %>%
+  mutate_at(vars(Black:Male), percent, 0.1) %>%
+  select(-Pop)
+
+FINAL.tab1.kab <- kable(FINAL.dem.2018.tab, caption = "Demographic Characteristics of Area Agency on Aging Regions in 2018", digits = 1) %>%
+  kable_styling(position = "center") %>%
+  kable_styling(latex_options = "hold_position")
+```
+
+\newpage
+## Table 1 Rural/Urban
+
+```{r echo=F}
+nchs <- read_csv("data/Table1_NCHSCodes/NCHSURCodes2013.csv")
+names(nchs) <- make.names(names(nchs), unique = TRUE)
+
+nchs2 <- nchs %>%
+  select(State = State.Abr., County = County.name, Code = X2013.code) %>%
+  filter(State == "MO") %>%
+  fix_names(County) %>%
+  left_join(aaa_regions, by = "County") %>%
+  arrange(AAARegion) %>%
+  mutate(Geo = dplyr::recode(Code,
+                      `1` = "Large central metro",
+                      `2` = "Large fringe metro",
+                      `3` = "Medium metro",
+                      `4` = "Small metro",
+                      `5` = "Micropolitan",
+                      `6` = "Noncore")) %>%
+  
+  mutate(Geo2 = dplyr::recode(Code,
+                      `1` = "Urban",
+                      `2` = "Suburban",
+                      `3` = "Suburban",
+                      `4` = "Suburban",
+                      `5` = "Rural",
+                      `6` = "Rural"))
+
+nchs2 %>% 
+  count(AAARegion, Geo2) %>% 
+  kable() %>%
+  kable_styling(latex_options = "striped") %>%
+  kable_styling(position = "center") %>%
+  kable_styling(latex_options = "hold_position")
+
+nchs2 %>% 
+  count(AAARegion, Geo) %>% 
+  kable() %>%
+  kable_styling(latex_options = "striped") %>%
+  kable_styling(position = "center") %>%
+  kable_styling(latex_options = "hold_position")
+```
+
+\newpage
+# Figure 1. Deaths of Despair in Missouri by Race and Ethnicity and Four Age Groups, 2001-2018
+
+```{r echo=FALSE, message=FALSE, error=FALSE, warning=FALSE, fig.align = "center", fig.width = 7, fig.height = 7}
+# get all
+f1b.pattern <- "^MO_(.+)_(.+)_(.+)_FourAges.txt$" # Parse Age and Race from filename
+f1b.read <- function(filename) { # Function to read and wrangle each CDC file
+  m <- str_match(filename, f1b.pattern)
+  f <- tidy_file(paste0("./data/Figure1_RawData/", filename), col_types = "ccddddddd") %>%
+    mutate(Year = m[2]) %>%
+    mutate(Age = m[3]) %>%
+    mutate(Race = m[4])
+  return(f)
+}
+
+# Read Every File in the Directory and Merge into a Single Dataframe
+f1b.files <- list.files(path = "./data/Figure1_RawData") # Get all filenames in directory
+f1b <- map_dfr(f1b.files, f1b.read) 
+
+# Wrangle
+f1b2 <- f1b %>%
+  filter(!is.na(State)) %>%
+  select(Year, Age, Race, Deaths, Population, Rate = Crude.Rate)
+
+# Calculate Rates
+f1b.rates <- f1b2 %>%
+  select(-Rate) %>%
+  pivot_wider(names_from = c("Race"), values_from = c("Deaths", "Population")) %>%
+  mutate(Deaths_Other = Deaths_AllRaces - (Deaths_BNH + Deaths_WNH),
+         Population_Other = Population_AllRaces - (Population_BNH + Population_WNH)) %>%
+  mutate(Deaths_Other = ifelse(Deaths_Other < 10, NA, Deaths_Other),
+         Other = (Deaths_Other/Population_Other)*100000,
+         BNH = (Deaths_BNH/Population_BNH)*100000,
+         WNH = (Deaths_WNH/Population_WNH)*100000)
+
+# Get Rates and Deaths For Table
+f1b.tab <- f1b.rates %>%
+  select(Year, Age, Other, BNH, WNH, Deaths_Other, Deaths_BNH, Deaths_WNH)
+
+# Get Rates for Plot
+f1b.plot <- f1b.rates %>%
+  pivot_longer(cols = c("Other", "BNH", "WNH"), names_to = "Race", values_to = "Rate") %>%
+  select(Year, Age, Race, Rate) %>%
+  mutate(Year = dplyr::recode(Year, `2001-2003` = 0,
+                              `2004-2006` = 1,
+                              `2007-2009` = 2,
+                              `2010-2012` = 3,
+                              `2013-2015` = 4,
+                              `2016-2018` = 5)) %>%
+  mutate(Race = dplyr::recode(Race, `BNH` = "Black non-Hispanics", `WNH` = "White non-Hispanics", `Other` = "Other")) %>%
+  mutate(Age = dplyr::recode(Age, `30-39` = "Ages 30-39", `40-49` = "Ages 40-49", `50-59` = "Ages 50-59", `60+` = "Ages 60+"))
+
+# Get Deaths for Plot
+f1b.plot.deaths <- f1b.rates %>%
+  pivot_longer(cols = c("Deaths_Other", "Deaths_BNH", "Deaths_WNH"), names_to = "Race", values_to = "Deaths") %>%
+  select(Year, Age, Race, Deaths) %>%
+  mutate(Race = recode(Race, `Deaths_Other` = "Other", `Deaths_BNH` = "BNH", `Deaths_WNH` = "WNH")) %>%
+  mutate(Year = dplyr::recode(Year, `2001-2003` = 0,
+                              `2004-2006` = 1,
+                              `2007-2009` = 2,
+                              `2010-2012` = 3,
+                              `2013-2015` = 4,
+                              `2016-2018` = 5)) %>%
+  mutate(Race = dplyr::recode(Race, `BNH` = "Black non-Hispanics", `WNH` = "White non-Hispanics", `Other` = "Other")) %>%
+  mutate(Age = dplyr::recode(Age, `30-39` = "Ages 30-39", `40-49` = "Ages 40-49", `50-59` = "Ages 50-59", `60+` = "Ages 60+"))
+
+# Merge Rates with Deaths (only start and end)
+f1b.plot2 <- f1b.plot %>%
+  left_join(f1b.plot.deaths, by = c("Year", "Age", "Race")) %>%
+  mutate(Deaths = ifelse(Year %in% c(0, 5), Deaths, NA))
+
+# Plot
+figure1.plot <- ggplot(f1b.plot2, aes(x = Year, y = Rate, color = Race, linetype = Race, shape = Race)) +
+  geom_point(size = 2.5) +
+  geom_line(size = 1) +
+  #geom_smooth() +
+  facet_wrap(~ Age) +
+  theme_classic() +
+  labs(y = "Deaths Per 100,000\n", x = "\nYear", color = "Race/Ethnicity", linetype = "Race/Ethnicity", shape = "Race/Ethnicity") +
+  expand_limits(y = 0) +
+  scale_color_npg() +
+  scale_x_continuous(breaks = 0:5, labels = c("2001-2003", "2004-2006", "2007-2009", "2010-2012", "2013-2015", "2016-2018")) +
+  theme(axis.text.x=element_text(angle = 90, vjust = 1, hjust = 1),
+        legend.position = "bottom") +
+  #theme(legend.position = "bottom") +
+  ggrepel::geom_label_repel(aes(label = Deaths), show.legend = FALSE,
+                   box.padding = 0.25, point.padding = 0.3, size = 3, segment.color = NA, hjust = 0) # segment.color = "gray60",
+figure1.plot
+```
+
+\blandscape
+
+\newpage
+## Figure 1 Data
+
+```{r echo=FALSE}
+# Wrangle Data
+f1b.tab2 <- f1b.tab %>%
+  #drop_na() %>%
+  select(Year, Age, RO = Other, RB = BNH, RW = WNH, DO = Deaths_Other, DB = Deaths_BNH, DW = Deaths_WNH) %>%
+  mutate(Other = paste0(sprintf("%.1f", RO), " (", DO, ")")) %>%
+  mutate(BNH = paste0(sprintf("%.1f", RB), " (", DB, ")")) %>%
+  mutate(WNH = paste0(sprintf("%.1f", RW), " (", DW, ")")) %>%
+  select(-RO, -RB, -RW, -DO, -DB, -DW) %>%
+  pivot_longer(cols = c("Other", "BNH", "WNH"), names_to = "Race", values_to = "RateDeaths")
+
+# 30-39 and 40-49
+f1b.tab2a <- f1b.tab2 %>%
+  filter(Age %in% c("30-39", "40-49")) %>%
+  pivot_wider(names_from = c("Race", "Age"), values_from = "RateDeaths", names_sep = " ")
+
+names(f1b.tab2a) <- c("Years", rep(c("Other", "BNH", "WNH"), 2)) # Rename
+
+# 30-39 and 40-49
+kable(f1b.tab2a, caption = "Rates of DoD Per 100,000 (and Death Counts) by Race/Ethnicity, 2001-2018 (Three-Year Rates), Ages 30-39 and 40-49") %>%
+  kable_styling(latex_options = "striped") %>%
+  kable_styling(position = "center") %>%
+  kable_styling(latex_options = "hold_position") %>%
+  add_header_above(c(" ", c("30-39" = 3, "40-49" = 3)))
+
+# Rename columns for 30-39 and 40-49
+f1b.tab2b <- f1b.tab2 %>%
+  filter(Age %in% c("50-59", "60+")) %>%
+  pivot_wider(names_from = c("Race", "Age"), values_from = "RateDeaths", names_sep = " ")
+
+names(f1b.tab2b) <- c("Years", rep(c("Other", "BNH", "WNH"), 2)) # Rename
+
+# 50-59 and 60+
+kable(f1b.tab2b, caption = "Rates of DoD Per 100,000 (and Death Counts) by Race/Ethnicity, 2001-2018 (Three-Year Rates), Ages 50-59 and 60+") %>%
+  kable_styling(latex_options = "striped") %>%
+  kable_styling(position = "center") %>%
+  kable_styling(latex_options = "hold_position") %>%
+  add_header_above(c(" ", c("50-59" = 3, "60+" = 3)))
+
+# Interpretation of Rates (For Final Revision)
+f1b.tab %>%
+  filter(Year %in% c("2001-2003", "2016-2018")) %>%
+  select(Year:WNH) %>%
+  arrange(Age, Year) %>%
+  pivot_wider(names_from = "Year", values_from = Other:WNH) %>%
+  setNames(c("Age", "O1", "O2", "BNH1", "BNH2", "WNH1", "WNH2")) %>%
+  mutate(O = (O2 - O1)/O1,
+         BNH = (BNH2 - BNH1)/BNH1,
+         WNH = (WNH2 - WNH1)/WNH1) %>%
+  mutate(across(O:WNH, ~scales::percent(., accuracy = .1)))
+```
+
+```{r include=FALSE}
+# Define I/O and Data Wrangling Functions
+f5.pattern <- "^(.+)_(\\d+)_(.+)_(.+).txt$" # Parse AAARegion and AgeGroup from filename
+get_map_data <- function(filename) { # Function to read and wrangle each CDC file
+  f <- read_tsv(paste0("./data/Figures2-3_RawData/", filename), col_names = TRUE, col_types = "ccdddcddd") # only one row to get?
+  names(f) <- make.names(names(f), unique = TRUE)
+  m <- str_match(filename, f5.pattern)
+  f <- f %>%
+    filter(!is.na(State)) %>%
+    mutate(Year = m[2]) %>%
+    mutate(AAARegion = m[3]) %>%
+    mutate(Age = m[4]) %>%
+    mutate(Type = m[5]) %>%
+    mutate(CrudeRate = (Deaths/Population)*100000) %>%
+    mutate(SE = CrudeRate * sqrt(1/Deaths),
+       LCI = CrudeRate - 1.96*SE,
+       UCI = CrudeRate + 1.96*SE) %>%
+    mutate(Race = "AllRaces")
+  return(f)
+}
+
+# Read Every File in the Directory and Merge into a Single Dataframe
+f5.files <- list.files(path = "./data/Figures2-3_RawData/") # Get all filenames in directory
+f5 <- map_dfr(f5.files, get_map_data) %>%
+  mutate(AAARegion = as.numeric(AAARegion)) # in order to merge with aaa_regions
+
+# Rename poisonings to drugs
+f5 <- f5 %>%
+  mutate(Type = dplyr::recode(Type, `SixAgeAllRaces` = "SixAgeAllRaces",
+                                    `Alcohol` = "Alcohol",
+                                    `Poisonings` = "Drugs",
+                                    `Suicide` = "Suicide"))
+# Setup Map http://mazamascience.com/WorkingWithData/?p=1494
+mo <- readOGR("./data/Figures2-3_Map/MOCountyBoundariesMap", "geo_export_1321899e-3190-4a6c-a920-1450d3423cae") # new
+mo@data$id <- rownames(mo@data)
+mo.pts <- fortify(mo, region = "id")
+mo.df <- merge(mo.pts, mo@data, by = "id")
+mo.df <- mo.df %>% # for new map only
+  rename(COUNTYFIPS = countyfips)
+
+# Create new conversion df
+map_fips <- gen_MO_counties_fips %>%
+  rename(COUNTYFIPS = county_code) %>%
+  mutate(COUNTYFIPS = as.factor(COUNTYFIPS)) %>%
+  rename(County = county)
+
+# Create aaa_regions
+aaa_regions2 <- aaa_regions %>%
+  rename(county = County) %>%
+  left_join(gen_MO_counties_fips, by = "county") %>%
+  rename(COUNTYFIPS = county_code) %>%
+  mutate(COUNTYFIPS = as.factor(COUNTYFIPS)) %>%
+  select(AAARegion, COUNTYFIPS) %>%
+  mutate(AAARegion = as.numeric(AAARegion)) %>%
+  mutate(b = ifelse(AAARegion > 5, 1, 0))
+
+# Join 
+mo.df3 <- mo.df %>%
+  left_join(aaa_regions2, by = "COUNTYFIPS")
+centroid <- aggregate(cbind(long, lat) ~ AAARegion, data = mo.df3, FUN = function(x) mean(range(x))) %>%
+    mutate(AAARegion = recode(AAARegion, `1` = "01. SeniorAge",
+                            `2` = "02. Aging Matters",
+                            `3` = "03. Care Connection for Aging", 
+                            `4` = "04. Northwest MO", 
+                            `5` = "05. Northeast MO", 
+                            `6` = "06. Aging Best", 
+                            `7` = "07. Mid-America Regional Council", 
+                            `8` = "08. Aging Ahead", 
+                            `9` = "09. St. Louis", 
+                            `10` = "10. Region X")) %>%
+  mutate(AAARegionNo = as.character(as.numeric(substr(AAARegion, 1, 2))))
+
+# Create labels that don't need to be repelled and those that do
+centroid.repel <- centroid %>%
+  filter(AAARegionNo == 9)
+centroid.no.repel <- centroid %>%
+  filter(AAARegionNo != 9)
+
+# Get adddresses
+# add.file <- read_csv("./aaaoffices.csv")
+# lat_longs <- add.file %>%
+#   geocode(Address, lat = latitude, long = longitude)
+# write_csv(lat_longs, "./aaaoffices2.csv")
+add <- read_csv("./data/Figures2-3_Map/AAAOfficeAddresses.csv")
+centroid2 <- centroid %>%
+  select(AAARegion) %>%
+  mutate(long = add$longitude, lat = add$latitude)
+
+# Dissolve county map by AAA regions & fortify to data frame # https://stackoverflow.com/questions/45928898/how-do-i-use-ggplot2-to-create-a-border-around-a-group-of-us-counties
+
+# Load AAA Regions Map (Dissolved county borders using QGIS and aaa_regions2.xlsx)
+aaa_map <- readOGR("./data/Figures2-3_Map/AAAMap", "aaa_mo_boundaries_cleaned")
+aaa_map@data$id <- rownames(aaa_map@data)
+aaa_map.pts <- fortify(aaa_map, region = "id")
+aaa_map.df <- merge(aaa_map.pts, aaa_map@data, by = "id")
+```
+
+```{r include=FALSE}
+# Function to Plot
+get_map <- function(age, race, title, year, type, barwidth = 30) {
+  
+  # Prepare the f5 data for mapping
+  f5.map <- f5 %>%
+    
+    # Filter by age, race
+    filter(Age %in% age) %>%
+    filter(Race %in% race) %>%
+    filter(Year %in% year) %>%
+    filter(Type %in% type) %>%
+    
+    # Select columns
+    select(AAARegion, Year, Age, Race, Deaths, Type, Population, CrudeRate, CrudeRateOG = Crude.Rate) %>%
+    mutate(CrudeRateOG = ifelse(CrudeRateOG == "Unreliable", NA, CrudeRateOG)) %>%
+    mutate(CrudeRateOG = as.numeric(CrudeRateOG)) %>%
+    right_join(aaa_regions, by = "AAARegion") %>%
+    left_join(map_fips, by = "County")
+  
+  # Merge f5 data with map data
+  f5.map2 <- mo.df %>%
+    left_join(f5.map, by = "COUNTYFIPS")
+  
+  # Plot Map
+  plot <- ggplot(f5.map2, aes(x = long, y = lat)) +
+    
+    # Draw outer border (remember to use aes(group =))
+    geom_path(color = "gray80", aes(group = group)) + # State border
+    
+    # Map DoD
+    geom_polygon(aes(group = group, fill = CrudeRate), color = alpha("white", 1 / 2), size = 0.2) + # County borders NOTE: USE CrudeRateOG here to avoid unreliable rates (based on <20 death counts)
+
+    # Add AAA Region boundaries
+    geom_polygon(data = aaa_map.df,
+                 aes(x = long, y = lat, group = group),
+                 fill = NA,
+                 size = 0.2,
+                 color = "gray50") + # these are the AAA region borders
+    
+    # Add AAA Region Labels (repel St. Louis City, but use 0 padding for the ones that don't need to be repelled)
+    ggrepel::geom_label_repel(data = centroid.no.repel, aes(x = long, y = lat, label = AAARegionNo),
+                              min.segment.length = 0,
+                              box.padding = 0, point.padding = 0, size = 2, 
+                              segment.color = "black", segment.size = 0.5) +
+    ggrepel::geom_label_repel(data = centroid.repel, aes(x = long, y = lat, label = AAARegionNo),
+                              min.segment.length = 0,
+                              box.padding = 0.25, point.padding = 0.3, size = 2, 
+                              segment.color = "black", segment.size = 0.5, seed = 100, hjust = 1) +
+    
+    #geom_label(data = centroid, aes(x = long, y = lat, label = AAARegionNo), size = 2, nudge_x = 0.2) +
+    
+    theme_nothing(legend = TRUE) + 
+    coord_map() + 
+    labs(title = title, fill = "Deaths Per 100,000") + 
+    theme(plot.title = element_text(hjust =0.5)) +
+    # scale_fill_viridis(option = "viridis", direction = -1, na.value = "gray90", 
+    #                    guide = guide_colourbar(direction = "vertical", barwidth = 0.5, barheight = 10))
+    
+    theme(plot.title = element_text(hjust =0.5), legend.position = "bottom",
+          strip.text.x = element_text(size = 12, color = "black", angle = 0),
+          strip.text.y = element_text(size = 12, color = "black", angle = -90),
+          strip.background = element_rect(fill = NA)) +
+    scale_fill_viridis(option = "inferno", direction = -1, na.value = "gray90", 
+                       guide = guide_colourbar(direction = "horizontal", barwidth = barwidth, barheight = 0.5)) # inferno
+  
+    #scale_fill_viridis(option = "viridis", direction = -1, na.value = "gray85") +
+    #facet_wrap(Year ~ Race, ncol = 6)
+  
+  return(list(df = f5.map, df.map = f5.map2, plot = plot))
+}
+```
+
+\newpage
+# Figure 2. Deaths of Despair in Missouri by Six Age Groups Between 1999-2001 and 2016-2018
+
+```{r echo=FALSE, message=FALSE, warning=FALSE, error=FALSE, fig.width = 11.5, fig.height = 6.5}
+# WNH
+map.age <- get_map(age = c("30-39", "40-49", "50-59", "60-69", "70-79", "80+"), 
+                   title = "", race = c("AllRaces"),
+                   year = c("1999-2001", "2016-2018"), type = "SixAgeAllRaces")
+
+# Create age labels
+age_labels <- c(`30-39` = "Age 30-39", `40-49` = "Age 40-49", `50-59` = "Age 50-59", `60-69` = "Age 60-69",
+                `70-79` = "Age 70-79", `80+` = "Age 80+")
+
+figure2.plot <- map.age$plot +
+  #facet_wrap(vars(Year, Age), ncol = 6)
+  facet_grid(Year ~ Age, labeller = labeller(Age = age_labels))
+figure2.plot
+```
+
+\newpage
+## Figure 2 Data
+
+```{r echo=FALSE}
+# 1999-2001
+f5.data <- f5 %>%
+  filter(Year %in% c("1999-2001")) %>%
+  filter(Age %in% c("30-39", "40-49", "50-59", "60-69", "70-79", "80+")) %>%
+  filter(Type %in% c("SixAgeAllRaces")) %>%
+  filter(Race %in% c("AllRaces")) %>%
+  select(Year, AAARegion, Race, Deaths, Population, Rate = CrudeRate, Age, Type) %>%
+  mutate(RateDeaths = paste0(sprintf("%.1f", Rate), " (", Deaths, ")")) %>%
+  select(Year, AAARegion, Age, RateDeaths) %>%
+  arrange(Year, AAARegion, Age, RateDeaths) %>%
+  pivot_wider(names_from = c("Year", "Age"), values_from = "RateDeaths", names_sep = " ") %>%
+  rename("AAA Region" = AAARegion)
+
+# Rename columns
+names(f5.data) <- c("AAA", rep(c("30-39", "40-49", "50-59", "60-69", "70-79", "80+") , 1))
+
+sup.tab1a <- kable(f5.data, caption = "Rates of DoD Per 100,000 (and Death Counts) by AAA Region and Age, 1999-2001") %>%
+  kable_styling(latex_options = "striped") %>%
+  kable_styling(position = "center") %>%
+  kable_styling(latex_options = "hold_position") %>%
+  add_header_above(c(" ", "1999-2011" = 6))
+sup.tab1a
+
+# 2016-2018
+f5.data2 <- f5 %>%
+  filter(Year %in% c("2016-2018")) %>%
+  filter(Age %in% c("30-39", "40-49", "50-59", "60-69", "70-79", "80+")) %>%
+  filter(Type %in% c("SixAgeAllRaces")) %>%
+  filter(Race %in% c("AllRaces")) %>%
+  select(Year, AAARegion, Race, Deaths, Population, Rate = CrudeRate, Age, Type) %>%
+  mutate(RateDeaths = paste0(sprintf("%.1f", Rate), " (", Deaths, ")")) %>%
+  select(Year, AAARegion, Age, RateDeaths) %>%
+  arrange(Year, AAARegion, Age, RateDeaths) %>%
+  pivot_wider(names_from = c("Year", "Age"), values_from = "RateDeaths", names_sep = " ") %>%
+  rename("AAA Region" = AAARegion)
+
+# Rename columns
+names(f5.data2) <- c("AAA", rep(c("30-39", "40-49", "50-59", "60-69", "70-79", "80+") , 1))
+
+sup.tab1b <- kable(f5.data2, caption = "Rates of DoD Per 100,000 (and Death Counts) by AAA Region and Age, 2016-2018") %>%
+  kable_styling(latex_options = "striped") %>%
+  kable_styling(position = "center") %>%
+  kable_styling(latex_options = "hold_position") %>%
+  add_header_above(c(" ", "2016-2018" = 6))
+sup.tab1b
+
+# Interpretation of Data
+f5.data # 1999-2001
+f5.data2 # 2016-2018
+
+#Region 9 30-39
+scales::percent((139.8-32.4)/32.4, accuracy = .1)
+```
+
+# Figure 3. Deaths of Despair in Missouri by Underlying Cause of Death Between 1999-2001 and 2016-2018
+
+```{r echo=FALSE, message=FALSE, warning=FALSE, error=FALSE, fig.width = 11.5, fig.height = 7.5}
+# Combined with facet wrap
+map.cause <- get_map(age = c("30-59", "60+"), race = c("AllRaces"), title = "", 
+                          year = c("1999-2001", "2016-2018"), type = c("Alcohol", "Suicide", "Drugs"))
+
+figure3.age_labels <- c(`30-59` = "Age 30-59", `60+` = "Age 60+")
+
+figure3.plot <- map.cause$plot +
+  #facet_grid(Type ~ Year + Age)
+  facet_grid(Type ~ Year + Age, labeller = labeller(Age = figure3.age_labels))
+figure3.plot
+```
+
+\newpage
+## Figure 3 Data
+
+```{r echo=FALSE}
+# Alcohol and Drugs
+f5.data.cause <- f5 %>%
+  filter(Year %in% c("1999-2001", "2016-2018")) %>%
+  filter(Age %in% c("30-59", "60+")) %>%
+  filter(Type %in% c("Alcohol", "Drugs")) %>%
+  filter(Race %in% c("AllRaces")) %>%
+  select(Year, AAARegion, Deaths, Population, Type, Rate = CrudeRate, Age) %>%
+  mutate(RateDeaths = paste0(sprintf("%.1f", Rate), " (", Deaths, ")")) %>%
+  select(Year, AAARegion, Age, Type, RateDeaths) %>%
+  arrange(AAARegion, Type, Year, Age, RateDeaths) %>%
+  pivot_wider(names_from = c("Type", "Year", "Age"), values_from = "RateDeaths", names_sep = " ") %>%
+  rename("AAA Region" = AAARegion)
+
+# Rename columns
+names(f5.data.cause) <- c("AAA", rep(c("30-59", "60+"), 4))
+
+# Generate kable
+sup.tab2a <- kable(f5.data.cause, caption = "Rates of DoD Per 100,000 (and Death Counts) by AAA Region, Age, and Underlying Cause of Death (Alcohol and Drugs)") %>%
+  kable_styling(latex_options = "striped") %>%
+  kable_styling(position = "center") %>%
+  kable_styling(latex_options = "hold_position") %>%
+  add_header_above(c(" ", rep(c("1999-2011" = 2, "2016-2018" = 2), 2))) %>%
+  add_header_above(c(" ", "Alcohol" = 4, "Drugs" = 4))
+sup.tab2a
+
+# Suicide
+f5.data.cause2 <- f5 %>%
+  filter(Year %in% c("1999-2001", "2016-2018")) %>%
+  filter(Age %in% c("30-59", "60+")) %>%
+  filter(Type %in% c("Suicide")) %>%
+  filter(Race %in% c("AllRaces")) %>%
+  select(Year, AAARegion, Deaths, Population, Type, Rate = CrudeRate, Age) %>%
+  mutate(RateDeaths = paste0(sprintf("%.1f", Rate), " (", Deaths, ")")) %>%
+  select(Year, AAARegion, Age, Type, RateDeaths) %>%
+  arrange(AAARegion, Type, Year, Age, RateDeaths) %>%
+  pivot_wider(names_from = c("Type", "Year", "Age"), values_from = "RateDeaths", names_sep = " ") %>%
+  rename("AAA Region" = AAARegion)
+
+# Rename columns
+names(f5.data.cause2) <- c("AAA", rep(c("30-59", "60+"), 2))
+
+# Generate kable
+sup.tab2b <- kable(f5.data.cause2, caption = "Rates of DoD Per 100,000 (and Death Counts) by AAA Region, Age, and Underlying Cause of Death (Suicide)") %>%
+  kable_styling(latex_options = "striped") %>%
+  kable_styling(position = "center") %>%
+  kable_styling(latex_options = "hold_position") %>%
+  add_header_above(c(" ", rep(c("1999-2011" = 2, "2016-2018" = 2), 1))) %>%
+  add_header_above(c(" ", "Suicide" = 4))
+sup.tab2b
+
+# Interpretation of Data
+# Drug relative rate increases 30-59
+scales::percent((39.7-7.8)/7.8, accuracy = .1) # Region 2
+scales::percent((49.1-5.3)/5.3, accuracy = .1) # Region 8
+scales::percent((118.4-20.4)/20.4, accuracy = .1) # Region 9
+```
+
+\newpage
+# Figure 4. Deaths of Despair in Missouri by Birth Cohort
+
+```{r echo=FALSE, message=FALSE, warning=FALSE, error=FALSE, fig.align = "center"}
+# Cohort Plot
+bc <- tidy_file("data/Figure4_RawData/1999-2018_ByYearByAge_MO_ALLRACES_FiveYearAgeGroups25-100Over_DoD.txt") %>%
+  filter(Crude.Rate != "Not Applicable") %>%
+  mutate(Crude.Rate = as.numeric(Crude.Rate))
+
+bc2 <- bc %>%
+  select(-Five.Year.Age.Groups.Code, -Deaths, -Population, -Notes, -Year.Code, Age = Five.Year.Age.Groups,
+         Rate = Crude.Rate) %>%
+  filter(Year %in% c(2003, 2008, 2013, 2018)) %>%
+  mutate(Min = as.numeric(str_sub(Age, 1, 2))) %>%
+  mutate(Time = ifelse(Year == 2003, 0,
+                ifelse(Year == 2008, 5,
+                ifelse(Year == 2013, 10, 15)))) %>%
+  pivot_wider(names_from = "Match", values_from = "Rate") %>% 
+  select(-c(Age, Min, Time)) %>%
+  group_by(Year) %>%
+  summarise_each(list(~sum(., na.rm = TRUE))) %>%
+  dplyr::select(-c(`80`, `70`, `75`, `20`, `15`, `10`)) %>% 
+  
+  pivot_longer(-Year, names_to = "Cohort", values_to = "Rate") %>% 
+  mutate(Time = ifelse(Year == 2003, 0,
+              ifelse(Year == 2008, 5,
+              ifelse(Year == 2013, 10, 15)))) %>% 
+  mutate(Age = as.numeric(Cohort) + Time) %>% 
+  mutate(Cohort = dplyr::recode(Cohort, 
+                                `25` = "1974-1978",
+                         `30` = "1969-1973",
+                         `35` = "1964-1968",
+                         `40` = "1959-1963",
+                         `45` = "1954-1958",
+                         `50` = "1949-1953",
+                         `55` = "1944-1948",
+                         `60` = "1939-1943",
+                         `65` = "1934-1938", .default = NA_character_))
+                          
+# Plot
+figure4.plot <- ggplot(bc2, aes(x = Age, y = Rate, linetype = Cohort, color = Cohort, shape = Cohort)) +
+  geom_line(size = 1) +
+  geom_point() +
+  theme_classic() +
+  scale_shape_manual(values=seq(0, 15)) +
+  labs(y = "Deaths Per 100,000\n", x = "\nAge", 
+       color = "Birth Cohort", linetype = "Birth Cohort", shape = "Birth Cohort") +
+  scale_x_continuous(breaks = seq(25, 80, 5), labels = c("25-29", "30-34", "35-39", "40-44", "45-49", "50-54", "55-59",
+                                                         "60-64", "65-69", "70-74", "75-79", "80-84")) +
+  scale_color_npg() +
+  theme(axis.text.x=element_text(angle = 90, vjust = 0.5, hjust = 1),
+        legend.position = "right")
+figure4.plot
+```
+
+## Figure 4 Data
+
+```{r echo=FALSE}
+bc3 <- bc2 %>%
+  mutate(Cohort = str_replace_all(Cohort, "19", "'")) %>%
+  pivot_wider(names_from = "Cohort", values_from = "Rate") %>%
+  select(-c(Time, Age)) %>%
+  group_by(Year) %>%
+  summarise_each(list(~sum(., na.rm = TRUE)))
+kable(bc3, caption = "Rates of DoD Per 100,000 by Birth Cohorts") %>%
+  kable_styling(latex_options = "striped") %>%
+  kable_styling(position = "center") %>%
+  kable_styling(latex_options = "hold_position")
+```
+
+\newpage
+# AAA Region Map
+
+```{r echo=FALSE, message=FALSE, warning=FALSE, error=FALSE}
+### AAA Regions
+ggplot(mo.df3, aes(x = long, y = lat)) +
+  geom_polygon(aes(group = group), fill = NA, color = "gray70") +
+  
+  # Add AAA Region boundaries
+  geom_polygon(data = aaa_map.df,
+               aes(x = long, y = lat, group = group),
+               fill = NA,
+               size = 1,
+               color = "black") + 
+  geom_point(data = add, aes(x = longitude, y = latitude), size = 4) +
+  ggmap::theme_nothing(legend = TRUE) + 
+  coord_map() + 
+  labs(title = "") + 
+  theme(plot.title = element_text(hjust =0.5), legend.position = "none") +
+  viridis::scale_fill_viridis(option = "viridis", direction = -1) +
+  ggrepel::geom_label_repel(data = centroid2, aes(x = long, y = lat, label = AAARegion), 
+                   box.padding = 0.25, point.padding = 0.3, size = 3, segment.color = "gray60", segment.size = 1.0)
+```
+
+\newpage
+## AAA Region Table
+
+```{r echo=FALSE, message=FALSE, warning=FALSE, error=FALSE}
+# Table
+AAA.tab <- aaa_regions %>%
+  mutate(AAARegion = recode(AAARegion, `1` = "01. SeniorAge",
+                        `2` = "02. Aging Matters",
+                        `3` = "03. Care Connection for Aging", 
+                        `4` = "04. Northwest MO", 
+                        `5` = "05. Northeast MO", 
+                        `6` = "06. Aging Best", 
+                        `7` = "07. Mid-America Regional Council", 
+                        `8` = "08. Aging Ahead", 
+                        `9` = "09. St. Louis", 
+                        `10` = "10. Region X"))
+AAA.tab.names <- sort(unique(AAA.tab$AAARegion))
+AAA.tab.values <- map_chr(1:10, function(x) { paste(aaa_regions$County[aaa_regions$AAARegion == x], collapse = ", ") })
+AAA.tab2 <- tibble(Region = AAA.tab.names, 
+                  Counties = AAA.tab.values) %>%
+  arrange(Region)
+kable(AAA.tab2, align = "l") %>%
+  kable_styling(latex_options = "striped") %>%
+  kable_styling(position = "center") %>%
+  kable_styling(latex_options = "hold_position") %>%
+  column_spec(1, width = "10em") %>%
+  column_spec(2, width = "35em")
+```
+
+```{r eval=FALSE, echo=FALSE, include=FALSE}
+# Export Table to HTML (Copy to Word From HTML)
+save_kable(tab1.kab, file = "./data/ExportedTableAndFigures/table1.html")
+save_kable(FINAL.tab1.kab, file = "./data/ExportedTableAndFigures/table1(new).html")
+
+# Export Figures to PNG Files (.EMF may have problems)
+ggsave("./data/ExportedTableAndFigures/figure1.png", plot = figure1.plot, width = 6.5, height = 7.5, dpi = 600)
+ggsave("./data/ExportedTableAndFigures/figure2.png", plot = figure2.plot, width = 11.5, height = 6, dpi = 600)
+ggsave("./data/ExportedTableAndFigures/figure3.png", plot = figure3.plot, width = 11.5, height = 7.5, dpi = 600)
+ggsave("./data/ExportedTableAndFigures/figure4.png", plot = figure4.plot, width = 6.5, height = 5, dpi = 600)
+
+# Export Supplementary Tables to HTML (Copy to Word From HTML)
+save_kable(sup.tab1a, file = "./data/ExportedTableAndFigures/supplementary_table1a.html")
+save_kable(sup.tab1b, file = "./data/ExportedTableAndFigures/supplementary_table1b.html")
+
+save_kable(sup.tab2a, file = "./data/ExportedTableAndFigures/supplementary_table2a.html")
+save_kable(sup.tab2b, file = "./data/ExportedTableAndFigures/supplementary_table2b.html")
+```
+
+\newpage
+# Sensitivity Analysis Using Age Adjustment
+
+Age adjustment is necessary if population structures are significantly different between comparison groups. As the following plot shows, the age-adjusted rates are nearly identical to the crude rates (deaths per 100,000):
+
+```{r echo=FALSE, message=FALSE, error=FALSE, warning=FALSE}
+# Sensitivity Analysis
+
+# Define I/O and Data Wrangling Functions
+sen.pattern <- "^(.+)_(\\d+)_(.+)_(.+).txt$" # Parse AAARegion and AgeGroup from filename
+get_sen_data <- function(filename) { # Function to read and wrangle each CDC file
+  f <- read_tsv(paste0("./data/SensitivityAnalysis/", filename), col_names = TRUE) # only one row to get? # , col_types = "ccdddcddd"
+  names(f) <- make.names(names(f), unique = TRUE)
+  m <- str_match(filename, sen.pattern)
+  f <- f %>%
+    filter(!is.na(State)) %>%
+    mutate(Year = m[2]) %>%
+    mutate(AAARegion = m[3]) %>%
+    mutate(Age = m[4]) %>%
+    mutate(Type = m[5]) %>%
+    mutate(CrudeRate = (Deaths/Population)*100000) %>%
+    mutate(SE = CrudeRate * sqrt(1/Deaths),
+       LCI = CrudeRate - 1.96*SE,
+       UCI = CrudeRate + 1.96*SE) %>%
+    #mutate(Race = recode(Race, `White` = "White", `Black or African American` = "Black"))
+    mutate(Race = "AllRaces")
+  return(f)
+}
+
+# Read Every File in the Directory and Merge into a Single Dataframe
+sen.files <- list.files(path = "./data/SensitivityAnalysis/") # Get all filenames in directory
+sen <- map_dfr(sen.files, get_sen_data) %>%
+  mutate(AAARegion = as.numeric(AAARegion)) # in order to merge with aaa_regions
+
+# Wrangle
+sen2 <- sen %>%
+  select(AAARegion, Year, Age, Crude.Rate, Age.Adjusted.Rate) %>%
+  pivot_longer(cols = c(Crude.Rate, Age.Adjusted.Rate))
+
+# Plot
+sen3 <- sen2 %>%
+  filter(AAARegion == 1)
+```
+
+## DoD With and Without Age Adjustment by AAA Regions and Two Age Groups
+
+```{r echo=FALSE, message=FALSE, error=FALSE, warning=FALSE}
+ggplot(sen2, aes(x = Year, y = value, fill = name)) +
+  geom_bar(stat = "identity", position = "dodge") +
+  theme_classic() +
+  facet_grid(Age ~ AAARegion) +
+  labs(fill = "Type of Rate", y = "Rate") +
+  theme(axis.text.x=element_text(angle = 90, vjust = 1, hjust = 1),
+        legend.position = "bottom") +
+  scale_fill_npg(labels = c("Age Adjusted Rate", "Crude Rate"))
+```
+
+\newpage
+# Figure 5: Sex & Cause of Death
+
+```{r}
+# Define I/O and Data Wrangling Functions
+sc.pattern <- "^(.+)_(.+)_(.+).txt$"
+sc.get.data <- function(filename) { # Function to read and wrangle each CDC file
+  f <- read_tsv(paste0("./data/Figure5_ForRevision_RawData/", filename), col_names = TRUE, col_types = "cccddd")
+  names(f) <- make.names(names(f), unique = TRUE)
+  m <- str_match(filename, sc.pattern)
+  f <- f %>%
+    filter(!is.na(Gender)) %>%
+    mutate(Year = m[2]) %>%
+    mutate(Age = m[3]) %>%
+    mutate(Type = m[4]) %>%
+    mutate(CrudeRate = (Deaths/Population)*100000) %>%
+    mutate(SE = CrudeRate * sqrt(1/Deaths),
+       LCI = CrudeRate - 1.96*SE,
+       UCI = CrudeRate + 1.96*SE) %>%
+    select(-Notes)
+  return(f)
+}
+
+# Load and merge files and rename poisonings to drugs
+sc.files <- list.files(path = "./data/Figure5_ForRevision_RawData/", full.names = F)
+sc <- map_dfr(sc.files, sc.get.data)
+
+# Generate Plot
+sc.plot <- sc %>%
+  mutate(Year = dplyr::recode(Year, 
+    `2001-2003` = 0,
+    `2004-2006` = 1,
+    `2007-2009` = 2,
+    `2010-2012` = 3,
+    `2013-2015` = 4,
+    `2016-2018` = 5)) %>%
+  mutate(Age = dplyr::recode(Age, `30-59` = "Ages 30-59", `60+` = "Ages 60+")) %>%
+  ggplot(aes(x = Year, y = CrudeRate, 
+             color = Gender, linetype = Gender, shape = Gender)) +
+  geom_point(size = 2.5) +
+  geom_line(size = 1) +
+  facet_grid(Age ~ Type) +
+  theme_classic() +
+  labs(y = "Deaths Per 100,000\n",
+       x = "\nYear", 
+       color = "Sex",
+       linetype = "Sex",
+       shape = "Sex") +
+  scale_fill_npg() +
+  theme(axis.text.x = element_text(angle = 90, vjust = 1, hjust = 1),
+    legend.position = "bottom") +
+  scale_x_continuous(breaks = 0:5,
+    labels = c("2001-2003", "2004-2006", "2007-2009", "2010-2012", 
+               "2013-2015", "2016-2018"))
+sc.plot
+
+# Save Plot
+ggsave("./data/ExportedTableAndFigures/figure5.png", plot = sc.plot, width = 8.5, height = 7.5, dpi = 600)
+```
+
+# Figure 5 Data
+
+```{r}
+sup.tab3 <- sc %>%
+  select(Year, Sex = Gender, Age, `Cause of Death` = Type, Rate = Crude.Rate, Deaths) %>%
+  mutate(RateDeaths = paste0(sprintf("%.1f", Rate), " (", Deaths, ")")) %>%
+  select(-Rate, -Deaths) %>%
+  pivot_wider(names_from = c("Age", "Year"), values_from = "RateDeaths", names_sep = " ", names_sort = T) %>%
+  relocate(`Cause of Death`) %>%
+  kbl(caption = "Deaths of Despair by Sex, Two Age Groups, and Underlying Cause of Death Between 2001-2003 and 2016-2018") %>%
+  kable_styling(latex_options = "striped") %>%
+  kable_styling(position = "center") %>%
+  kable_styling(latex_options = "hold_position") %>%
+  add_header_above(c(" ", " ", "Ages 30-59" = 6, "Ages 60+" = 6))
+sup.tab3
+
+# Export Supplementary Tables to HTML (Copy to Word From HTML)
+save_kable(sup.tab3, file = "./data/ExportedTableAndFigures/supplementary_table3.html")
+
+# Interpretation Rates
+sc_int <- sc %>%
+  filter(Year %in% c("2001-2003", "2016-2018")) %>%
+  select(Gender, Rate = Crude.Rate, Year, Age, Type) %>%
+  pivot_wider(names_from = c("Year"), values_from = "Rate", names_sep = " ", names_sort = T) %>%
+  janitor::clean_names() %>%
+  rowwise() %>%
+  mutate(pct_diff = (x2016_2018 - x2001_2003) / x2001_2003) %>%
+  mutate(pct_diff_f = scales::percent(pct_diff, accuracy = .1)) %>%
+  ungroup()
+sc_int
+
+sc_int %>%
+  arrange(type, age)
+```
